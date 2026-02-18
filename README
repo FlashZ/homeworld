@@ -6,3 +6,6 @@ download this source code. Unfortunately, as you can see from that link
 the RDN seems to be defunct. Rather than let the source code get lost 
 because of legal dumbness I'm posting it here in the hope that Relic either 
 fixes RDN or doesn't care enough to make me take it down.
+
+
+Open-source WON lobby/matchmaking replacement stack (including a simple Titan bridge daemon) is available at `tools/won_oss_server/`.
