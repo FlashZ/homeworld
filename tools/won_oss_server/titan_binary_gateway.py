@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
-"""Minimal binary Titan gateway.
+"""Binary Titan gateway with session state machine.
 
-Wire format (MVP):
-- 4-byte big-endian length (N)
-- N-byte frame payload:
+MVP wire format:
+- 4-byte big-endian frame length
+- body:
   - 1-byte opcode
-  - UTF-8 JSON payload bytes
+  - 2-byte field count
+  - repeated fields: [1-byte key_len][key][2-byte val_len][value]
+
+Values are UTF-8 strings; numeric values are stringified.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, Tuple
+import json
 
-# Core opcodes
 OP_PING = 0x01
 OP_DIR_GET = 0x10
 OP_ROUTE_CHAT = 0x20
 OP_AUTH_LOGIN = 0x30
-
-# Session-flow opcodes for launchable flow
 OP_REGISTER_PLAYER = 0x31
 OP_CREATE_LOBBY = 0x32
 OP_JOIN_LOBBY = 0x33
@@ -32,23 +33,89 @@ OP_POLL_EVENTS = 0x35
 OP_ROUTE_REGISTER = 0x36
 
 
+class ConnState(str, Enum):
+    CONNECTED = "CONNECTED"
+    AUTHED = "AUTHED"
+    PLAYER_READY = "PLAYER_READY"
+
+
 @dataclass
 class ConnectionContext:
     token: str | None = None
     player_id: str | None = None
+    state: ConnState = ConnState.CONNECTED
+    registered_lobbies: set[str] = field(default_factory=set)
+
+
+def _to_wire_map(payload: Dict[str, object]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in payload.items():
+        if isinstance(v, bool):
+            out[k] = "true" if v else "false"
+        elif isinstance(v, (dict, list)):
+            out[k] = json.dumps(v)
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _from_wire_map(payload: Dict[str, str]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for k, v in payload.items():
+        vv = v.strip()
+        if vv in ("true", "false"):
+            out[k] = vv == "true"
+        elif vv.isdigit():
+            out[k] = int(vv)
+        elif (vv.startswith("{") and vv.endswith("}")) or (vv.startswith("[") and vv.endswith("]")):
+            try:
+                out[k] = json.loads(vv)
+            except Exception:
+                out[k] = v
+        else:
+            out[k] = v
+    return out
 
 
 def encode_frame(opcode: int, payload: Dict[str, object]) -> bytes:
-    body = bytes([opcode]) + json.dumps(payload).encode("utf-8")
+    wm = _to_wire_map(payload)
+    fields = []
+    for k, v in wm.items():
+        kb = k.encode("utf-8")
+        vb = v.encode("utf-8")
+        if len(kb) > 255:
+            raise ValueError("key_too_long")
+        fields.append(struct.pack(">B", len(kb)) + kb + struct.pack(">H", len(vb)) + vb)
+    body = bytes([opcode]) + struct.pack(">H", len(fields)) + b"".join(fields)
     return struct.pack(">I", len(body)) + body
 
 
 def decode_frame(data: bytes) -> Tuple[int, Dict[str, object]]:
-    if not data:
-        raise ValueError("empty_frame")
+    if len(data) < 3:
+        raise ValueError("short_frame")
     opcode = data[0]
-    payload = json.loads(data[1:].decode("utf-8")) if len(data) > 1 else {}
-    return opcode, payload
+    nfields = struct.unpack(">H", data[1:3])[0]
+    i = 3
+    raw: Dict[str, str] = {}
+    for _ in range(nfields):
+        if i >= len(data):
+            raise ValueError("truncated_keylen")
+        klen = data[i]
+        i += 1
+        if i + klen > len(data):
+            raise ValueError("truncated_key")
+        key = data[i : i + klen].decode("utf-8")
+        i += klen
+        if i + 2 > len(data):
+            raise ValueError("truncated_vallen")
+        vlen = struct.unpack(">H", data[i : i + 2])[0]
+        i += 2
+        if i + vlen > len(data):
+            raise ValueError("truncated_value")
+        val = data[i : i + vlen].decode("utf-8")
+        i += vlen
+        raw[key] = val
+    return opcode, _from_wire_map(raw)
 
 
 def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionContext) -> Dict[str, object]:
@@ -56,28 +123,15 @@ def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionCon
         return {"action": "PING"}
     if opcode == OP_DIR_GET:
         return {"action": "TITAN_DIR_GET", "path": str(payload.get("path", "/TitanServers"))}
-    if opcode == OP_ROUTE_CHAT:
-        return {
-            "action": "TITAN_ROUTE_CHAT",
-            "lobby_id": str(payload["lobby_id"]),
-            "from_player": str(payload.get("from_player", ctx.player_id or "unknown")),
-            "message": str(payload["message"]),
-        }
     if opcode == OP_AUTH_LOGIN:
-        return {
-            "action": "AUTH_LOGIN",
-            "username": str(payload.get("username", "guest")),
-            "password": str(payload.get("password", "")),
-        }
+        return {"action": "AUTH_LOGIN", "username": str(payload.get("username", "guest")), "password": str(payload.get("password", ""))}
     if opcode == OP_REGISTER_PLAYER:
-        return {
-            "action": "REGISTER_PLAYER",
-            "player_id": str(payload["player_id"]),
-            "nickname": str(payload.get("nickname", payload["player_id"])),
-        }
-    if opcode == OP_CREATE_LOBBY:
-        if not ctx.token:
+        if ctx.state == ConnState.CONNECTED:
             return {"action": "INVALID", "error": "auth_required"}
+        return {"action": "REGISTER_PLAYER", "player_id": str(payload["player_id"]), "nickname": str(payload.get("nickname", payload["player_id"]))}
+    if opcode == OP_CREATE_LOBBY:
+        if ctx.state != ConnState.PLAYER_READY or not ctx.token:
+            return {"action": "INVALID", "error": "player_not_ready"}
         return {
             "action": "CREATE_LOBBY",
             "token": ctx.token,
@@ -88,23 +142,26 @@ def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionCon
             "max_players": int(payload.get("max_players", 4)),
         }
     if opcode == OP_JOIN_LOBBY:
-        return {
-            "action": "JOIN_LOBBY",
-            "lobby_id": str(payload["lobby_id"]),
-            "player_id": str(payload.get("player_id", ctx.player_id or "")),
-            "password": str(payload.get("password", "")),
-        }
-    if opcode == OP_START_GAME:
-        return {
-            "action": "TITAN_START_GAME",
-            "lobby_id": str(payload["lobby_id"]),
-            "requester_id": str(payload.get("requester_id", ctx.player_id or "")),
-            "port": payload.get("port"),
-        }
-    if opcode == OP_POLL_EVENTS:
-        return {"action": "ROUTE_POLL", "player_id": str(payload.get("player_id", ctx.player_id or "")), "after_seq": int(payload.get("after_seq", 0))}
+        if ctx.state != ConnState.PLAYER_READY:
+            return {"action": "INVALID", "error": "player_not_ready"}
+        return {"action": "JOIN_LOBBY", "lobby_id": str(payload["lobby_id"]), "player_id": str(payload.get("player_id", ctx.player_id or "")), "password": str(payload.get("password", ""))}
     if opcode == OP_ROUTE_REGISTER:
-        return {"action": "TITAN_ROUTE_REGISTER", "player_id": str(payload.get("player_id", ctx.player_id or ""))}
+        if ctx.state != ConnState.PLAYER_READY:
+            return {"action": "INVALID", "error": "player_not_ready"}
+        return {"action": "TITAN_ROUTE_REGISTER", "lobby_id": str(payload["lobby_id"]), "player_id": str(payload.get("player_id", ctx.player_id or ""))}
+    if opcode == OP_ROUTE_CHAT:
+        lid = str(payload["lobby_id"])
+        if lid not in ctx.registered_lobbies:
+            return {"action": "INVALID", "error": "route_not_registered"}
+        return {"action": "TITAN_ROUTE_CHAT", "lobby_id": lid, "from_player": str(payload.get("from_player", ctx.player_id or "unknown")), "message": str(payload["message"])}
+    if opcode == OP_START_GAME:
+        if ctx.state != ConnState.PLAYER_READY:
+            return {"action": "INVALID", "error": "player_not_ready"}
+        return {"action": "TITAN_START_GAME", "lobby_id": str(payload["lobby_id"]), "requester_id": str(payload.get("requester_id", ctx.player_id or "")), "port": payload.get("port")}
+    if opcode == OP_POLL_EVENTS:
+        if ctx.state == ConnState.CONNECTED:
+            return {"action": "INVALID", "error": "auth_required"}
+        return {"action": "ROUTE_POLL", "player_id": str(payload.get("player_id", ctx.player_id or "")), "after_seq": int(payload.get("after_seq", 0))}
     return {"action": "UNKNOWN_BINARY_OPCODE", "opcode": opcode}
 
 
@@ -113,12 +170,12 @@ def action_to_response_opcode(opcode: int) -> int:
 
 
 async def call_backend(host: str, port: int, payload: Dict[str, object]) -> Dict[str, object]:
-    reader, writer = await asyncio.open_connection(host, port)
-    writer.write((json.dumps(payload) + "\n").encode("utf-8"))
-    await writer.drain()
-    line = await reader.readline()
-    writer.close()
-    await writer.wait_closed()
+    r, w = await asyncio.open_connection(host, port)
+    w.write((json.dumps(payload) + "\n").encode("utf-8"))
+    await w.drain()
+    line = await r.readline()
+    w.close()
+    await w.wait_closed()
     return json.loads(line.decode("utf-8")) if line else {"ok": False, "error": "backend_no_response"}
 
 
@@ -149,16 +206,20 @@ class BinaryGatewayServer:
                     except Exception as exc:
                         response = {"ok": False, "error": str(exc)}
 
-                # maintain connection context
                 if opcode == OP_AUTH_LOGIN and response.get("ok") and isinstance(response.get("token"), str):
                     ctx.token = str(response["token"])
+                    ctx.state = ConnState.AUTHED
                 if opcode == OP_REGISTER_PLAYER and response.get("ok"):
-                    player = response.get("player", {})
-                    if isinstance(player, dict) and isinstance(player.get("player_id"), str):
-                        ctx.player_id = str(player["player_id"])
+                    p = response.get("player", {})
+                    if isinstance(p, dict) and isinstance(p.get("player_id"), str):
+                        ctx.player_id = str(p["player_id"])
+                        ctx.state = ConnState.PLAYER_READY
+                if opcode == OP_ROUTE_REGISTER and response.get("ok"):
+                    lid = str(action.get("lobby_id", ""))
+                    if lid:
+                        ctx.registered_lobbies.add(lid)
 
-                wire = encode_frame(action_to_response_opcode(opcode), response)
-                writer.write(wire)
+                writer.write(encode_frame(action_to_response_opcode(opcode), response))
                 await writer.drain()
         except asyncio.IncompleteReadError:
             pass
@@ -173,14 +234,14 @@ class BinaryGatewayServer:
 async def main_async(args: argparse.Namespace) -> None:
     srv = BinaryGatewayServer(args.backend_host, args.backend_port)
     server = await asyncio.start_server(srv.handle_client, args.host, args.port)
-    addrs = ", ".join(str(s.getsockname()) for s in server.sockets or [])
+    addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
     print(f"Titan binary gateway listening on {addrs} -> {args.backend_host}:{args.backend_port}")
     async with server:
         await server.serve_forever()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Minimal binary Titan gateway")
+    p = argparse.ArgumentParser(description="Binary Titan gateway with connection state machine")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9200)
     p.add_argument("--backend-host", default="127.0.0.1")

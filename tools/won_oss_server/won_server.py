@@ -172,6 +172,7 @@ class WONLikeState:
         self.sessions: Dict[str, str] = {}
         self.directory: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.events_by_player: Dict[str, List[Dict[str, Any]]] = {}
+        self.route_membership: Dict[str, Set[str]] = {}
         self.event_seq = 0
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self.started_at = time.time()
@@ -199,6 +200,8 @@ class WONLikeState:
         for r in cur.execute("SELECT lobby_id,player_id,position FROM lobby_players ORDER BY position ASC"):
             if r["lobby_id"] in self.lobbies:
                 self.lobbies[r["lobby_id"]].players.append(r["player_id"])
+        for lid, lob in self.lobbies.items():
+            self.route_membership[lid] = set(lob.players)
         for r in cur.execute("SELECT * FROM game_servers"):
             self.game_servers[r["server_id"]] = GameServer(
                 r["server_id"], r["host"], int(r["port"]), r["region"], int(r["current_players"]), int(r["max_players"]),
@@ -339,6 +342,7 @@ class WONLikeState:
         lobby = Lobby(f"lob_{secrets.token_hex(4)}", name, owner_id, map_name, max_players, region, password=password, players=[owner_id], metadata=metadata or {})
         self.lobbies[lobby.lobby_id] = lobby
         self.dir_upsert("/Homeworld", lobby.lobby_id, "routing_room", self._room_data_objects(lobby))
+        self.route_membership[lobby.lobby_id] = set(lobby.players)
         self._persist_lobbies()
         self._emit_event(lobby.players, "lobby_created", {"lobby_id": lobby.lobby_id})
         return lobby
@@ -352,6 +356,7 @@ class WONLikeState:
                 raise ValueError("lobby_full")
             lobby.players.append(player_id)
         self.dir_upsert("/Homeworld", lobby_id, "routing_room", self._room_data_objects(lobby))
+        self.route_membership[lobby_id] = set(lobby.players)
         self._persist_lobbies()
         self._emit_event(lobby.players, "lobby_join", {"lobby_id": lobby_id, "player_id": player_id})
         return lobby
@@ -364,12 +369,14 @@ class WONLikeState:
             del self.lobbies[lobby_id]
             with contextlib.suppress(KeyError):
                 del self.directory["/Homeworld"][lobby_id]
+            self.route_membership.pop(lobby_id, None)
             self._persist_directory()
             self._persist_lobbies()
             return
         if lobby.owner_id == player_id:
             lobby.owner_id = lobby.players[0]
         self.dir_upsert("/Homeworld", lobby_id, "routing_room", self._room_data_objects(lobby))
+        self.route_membership[lobby_id] = set(lobby.players)
         self._persist_lobbies()
         self._emit_event(lobby.players, "lobby_leave", {"lobby_id": lobby_id, "player_id": player_id})
 
@@ -480,7 +487,15 @@ class WONLikeState:
     def dir_list(self, path: str) -> Dict[str, Dict[str, Any]]:
         return self.directory.get(path, {})
 
+    def register_route_client(self, lobby_id: str, player_id: str) -> None:
+        lobby = self.lobbies[lobby_id]
+        if player_id not in lobby.players:
+            raise ValueError("not_in_lobby")
+        self.route_membership.setdefault(lobby_id, set()).add(player_id)
+
     def route_send_chat(self, lobby_id: str, from_player: str, message: str) -> None:
+        if from_player not in self.route_membership.get(lobby_id, set()):
+            raise ValueError("route_not_registered")
         self._emit_event(self.lobbies[lobby_id].players, "chat", {"lobby_id": lobby_id, "from": from_player, "message": message})
 
     def poll_events(self, player_id: str, after_seq: int = 0) -> List[Dict[str, Any]]:
@@ -622,8 +637,8 @@ class WONLikeProtocolServer:
             self.state.route_send_chat(req["lobby_id"], req["from_player"], req["message"])
             return {"ok": True}
         if action == "TITAN_ROUTE_REGISTER":
-            # compatibility placeholder: explicit ack for routing registration
-            return {"ok": True, "registered": req.get("player_id")}
+            self.state.register_route_client(req["lobby_id"], req["player_id"])
+            return {"ok": True, "registered": req.get("player_id"), "lobby_id": req.get("lobby_id")}
         if action == "TITAN_START_GAME":
             launch = self.state.start_game_from_lobby(req["lobby_id"], req["requester_id"], req.get("port"))
             return {"ok": True, "launch": launch}

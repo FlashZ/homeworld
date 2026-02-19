@@ -27,6 +27,7 @@ from tools.won_oss_server.titan_binary_gateway import (
     OP_PING,
     OP_POLL_EVENTS,
     OP_REGISTER_PLAYER,
+    OP_ROUTE_CHAT,
     OP_ROUTE_REGISTER,
     OP_START_GAME,
     decode_frame,
@@ -34,6 +35,7 @@ from tools.won_oss_server.titan_binary_gateway import (
     opcode_to_action,
     BinaryGatewayServer,
     ConnectionContext,
+    ConnState,
 )
 
 
@@ -198,6 +200,7 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
         await rr.readline()
         ww.close()
         await ww.wait_closed()
+        rr.feed_eof()
 
         _, create = await send(OP_CREATE_LOBBY, {"name": "Ready", "map_name": "Garden", "region": "na", "max_players": 4})
         self.assertTrue(create["ok"])
@@ -220,7 +223,7 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reg2["ok"])
         _, join = await send2(OP_JOIN_LOBBY, {"lobby_id": lobby_id})
         self.assertTrue(join["ok"])
-        _, route_reg = await send2(OP_ROUTE_REGISTER, {})
+        _, route_reg = await send2(OP_ROUTE_REGISTER, {"lobby_id": lobby_id})
         self.assertTrue(route_reg["ok"])
 
         _, start = await send(OP_START_GAME, {"lobby_id": lobby_id})
@@ -233,6 +236,37 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         w.close(); await w.wait_closed()
         w2.close(); await w2.wait_closed()
+
+
+    async def test_state_machine_enforced(self):
+        r, w = await asyncio.open_connection("127.0.0.1", self.gateway_port)
+
+        async def send(op, payload):
+            w.write(encode_frame(op, payload))
+            await w.drain()
+            hdr = await r.readexactly(4)
+            ln = struct.unpack(">I", hdr)[0]
+            body = await r.readexactly(ln)
+            return decode_frame(body)
+
+        _, noauth = await send(OP_REGISTER_PLAYER, {"player_id": "x"})
+        self.assertFalse(noauth["ok"])
+
+        _, auth = await send(OP_AUTH_LOGIN, {"username": "stateu", "password": "pw"})
+        self.assertTrue(auth["ok"])
+        _, reg = await send(OP_REGISTER_PLAYER, {"player_id": "statep", "nickname": "State"})
+        self.assertTrue(reg["ok"])
+        _, create = await send(OP_CREATE_LOBBY, {"name":"S", "map_name":"Garden", "region":"na", "max_players": 4})
+        self.assertTrue(create["ok"])
+        lid = create["lobby"]["lobby_id"]
+
+        _, chat_before_reg = await send(OP_ROUTE_CHAT, {"lobby_id": lid, "message": "x"})
+        self.assertFalse(chat_before_reg["ok"])
+
+        _, reg_route = await send(OP_ROUTE_REGISTER, {"lobby_id": lid})
+        self.assertTrue(reg_route["ok"])
+
+        w.close(); await w.wait_closed()
 
     def test_opcode_mapping(self):
         ctx = ConnectionContext()
