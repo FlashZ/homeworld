@@ -6,9 +6,6 @@ Wire format (MVP):
 - N-byte frame payload:
   - 1-byte opcode
   - UTF-8 JSON payload bytes
-
-This is not full historical Titan framing, but provides a binary transport bridge
-for incremental compatibility work.
 """
 
 from __future__ import annotations
@@ -17,13 +14,28 @@ import argparse
 import asyncio
 import json
 import struct
+from dataclasses import dataclass
 from typing import Dict, Tuple
 
-# Minimal opcode map for next-step binary path
+# Core opcodes
 OP_PING = 0x01
 OP_DIR_GET = 0x10
 OP_ROUTE_CHAT = 0x20
 OP_AUTH_LOGIN = 0x30
+
+# Session-flow opcodes for launchable flow
+OP_REGISTER_PLAYER = 0x31
+OP_CREATE_LOBBY = 0x32
+OP_JOIN_LOBBY = 0x33
+OP_START_GAME = 0x34
+OP_POLL_EVENTS = 0x35
+OP_ROUTE_REGISTER = 0x36
+
+
+@dataclass
+class ConnectionContext:
+    token: str | None = None
+    player_id: str | None = None
 
 
 def encode_frame(opcode: int, payload: Dict[str, object]) -> bytes:
@@ -39,7 +51,7 @@ def decode_frame(data: bytes) -> Tuple[int, Dict[str, object]]:
     return opcode, payload
 
 
-def opcode_to_action(opcode: int, payload: Dict[str, object]) -> Dict[str, object]:
+def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionContext) -> Dict[str, object]:
     if opcode == OP_PING:
         return {"action": "PING"}
     if opcode == OP_DIR_GET:
@@ -48,7 +60,7 @@ def opcode_to_action(opcode: int, payload: Dict[str, object]) -> Dict[str, objec
         return {
             "action": "TITAN_ROUTE_CHAT",
             "lobby_id": str(payload["lobby_id"]),
-            "from_player": str(payload["from_player"]),
+            "from_player": str(payload.get("from_player", ctx.player_id or "unknown")),
             "message": str(payload["message"]),
         }
     if opcode == OP_AUTH_LOGIN:
@@ -57,11 +69,46 @@ def opcode_to_action(opcode: int, payload: Dict[str, object]) -> Dict[str, objec
             "username": str(payload.get("username", "guest")),
             "password": str(payload.get("password", "")),
         }
+    if opcode == OP_REGISTER_PLAYER:
+        return {
+            "action": "REGISTER_PLAYER",
+            "player_id": str(payload["player_id"]),
+            "nickname": str(payload.get("nickname", payload["player_id"])),
+        }
+    if opcode == OP_CREATE_LOBBY:
+        if not ctx.token:
+            return {"action": "INVALID", "error": "auth_required"}
+        return {
+            "action": "CREATE_LOBBY",
+            "token": ctx.token,
+            "owner_id": str(payload.get("owner_id", ctx.player_id or "")),
+            "name": str(payload.get("name", "Lobby")),
+            "map_name": str(payload.get("map_name", "Garden")),
+            "region": str(payload.get("region", "global")),
+            "max_players": int(payload.get("max_players", 4)),
+        }
+    if opcode == OP_JOIN_LOBBY:
+        return {
+            "action": "JOIN_LOBBY",
+            "lobby_id": str(payload["lobby_id"]),
+            "player_id": str(payload.get("player_id", ctx.player_id or "")),
+            "password": str(payload.get("password", "")),
+        }
+    if opcode == OP_START_GAME:
+        return {
+            "action": "TITAN_START_GAME",
+            "lobby_id": str(payload["lobby_id"]),
+            "requester_id": str(payload.get("requester_id", ctx.player_id or "")),
+            "port": payload.get("port"),
+        }
+    if opcode == OP_POLL_EVENTS:
+        return {"action": "ROUTE_POLL", "player_id": str(payload.get("player_id", ctx.player_id or "")), "after_seq": int(payload.get("after_seq", 0))}
+    if opcode == OP_ROUTE_REGISTER:
+        return {"action": "TITAN_ROUTE_REGISTER", "player_id": str(payload.get("player_id", ctx.player_id or ""))}
     return {"action": "UNKNOWN_BINARY_OPCODE", "opcode": opcode}
 
 
 def action_to_response_opcode(opcode: int) -> int:
-    # keep 1:1 response opcode for now
     return opcode
 
 
@@ -81,6 +128,7 @@ class BinaryGatewayServer:
         self.backend_port = backend_port
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        ctx = ConnectionContext()
         try:
             while True:
                 hdr = await reader.readexactly(4)
@@ -89,22 +137,33 @@ class BinaryGatewayServer:
                     raise ValueError("invalid_frame_length")
                 body = await reader.readexactly(length)
                 opcode, payload = decode_frame(body)
-                action = opcode_to_action(opcode, payload)
-                if action.get("action") == "UNKNOWN_BINARY_OPCODE":
+                action = opcode_to_action(opcode, payload, ctx)
+
+                if action.get("action") == "INVALID":
+                    response = {"ok": False, "error": action.get("error", "invalid")}
+                elif action.get("action") == "UNKNOWN_BINARY_OPCODE":
                     response = {"ok": False, "error": "unknown_binary_opcode", "opcode": opcode}
                 else:
                     try:
                         response = await call_backend(self.backend_host, self.backend_port, action)
                     except Exception as exc:
                         response = {"ok": False, "error": str(exc)}
+
+                # maintain connection context
+                if opcode == OP_AUTH_LOGIN and response.get("ok") and isinstance(response.get("token"), str):
+                    ctx.token = str(response["token"])
+                if opcode == OP_REGISTER_PLAYER and response.get("ok"):
+                    player = response.get("player", {})
+                    if isinstance(player, dict) and isinstance(player.get("player_id"), str):
+                        ctx.player_id = str(player["player_id"])
+
                 wire = encode_frame(action_to_response_opcode(opcode), response)
                 writer.write(wire)
                 await writer.drain()
         except asyncio.IncompleteReadError:
             pass
         except Exception as exc:
-            err = encode_frame(0xFF, {"ok": False, "error": str(exc)})
-            writer.write(err)
+            writer.write(encode_frame(0xFF, {"ok": False, "error": str(exc)}))
             await writer.drain()
         finally:
             writer.close()

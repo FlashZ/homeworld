@@ -443,6 +443,36 @@ class WONLikeState:
         server = sorted(candidates, key=lambda s: (s.max_players - s.current_players), reverse=True)[0]
         return {"match": "server", "server": serialize_server(server)}
 
+
+    def start_game_from_lobby(self, lobby_id: str, requester_id: str, game_port: Optional[int] = None) -> Dict[str, Any]:
+        lobby = self.lobbies[lobby_id]
+        if lobby.owner_id != requester_id:
+            raise ValueError("only_owner_can_start")
+        if len(lobby.players) < 2:
+            raise ValueError("not_enough_players")
+
+        selected = None
+        candidates = [s for s in self.game_servers.values() if s.region == lobby.region]
+        if candidates:
+            selected = sorted(candidates, key=lambda s: (s.max_players - s.current_players), reverse=True)[0]
+        elif self.factories:
+            fac = sorted(self.factories.values(), key=lambda f: f.running)[0]
+            port = int(game_port or (2300 + fac.running))
+            selected = self.factory_start_process(fac.factory_id, "RoutingServHWGame", "homeworld", port)
+        else:
+            raise ValueError("no_game_capacity")
+
+        selected.current_players = min(selected.max_players, len(lobby.players))
+        self._persist_servers()
+        launch = {
+            "lobby_id": lobby_id,
+            "server": serialize_server(selected),
+            "players": list(lobby.players),
+            "map_name": lobby.map_name,
+        }
+        self._emit_event(lobby.players, "game_launch", launch)
+        return launch
+
     def dir_upsert(self, path: str, entity_name: str, entity_type: str, payload: Dict[str, Any]) -> None:
         self.directory.setdefault(path, {})[entity_name] = {"entity_type": entity_type, "payload": payload}
         self._persist_directory()
@@ -591,6 +621,12 @@ class WONLikeProtocolServer:
         if action == "TITAN_ROUTE_CHAT":
             self.state.route_send_chat(req["lobby_id"], req["from_player"], req["message"])
             return {"ok": True}
+        if action == "TITAN_ROUTE_REGISTER":
+            # compatibility placeholder: explicit ack for routing registration
+            return {"ok": True, "registered": req.get("player_id")}
+        if action == "TITAN_START_GAME":
+            launch = self.state.start_game_from_lobby(req["lobby_id"], req["requester_id"], req.get("port"))
+            return {"ok": True, "launch": launch}
 
         return {"ok": False, "error": f"unknown_action:{action}"}
 

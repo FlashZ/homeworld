@@ -21,12 +21,19 @@ from tools.won_oss_server.won_server import (
 from tools.won_oss_server.titan_bridge import parse_legacy_command
 from tools.won_oss_server.titan_binary_gateway import (
     OP_AUTH_LOGIN,
+    OP_CREATE_LOBBY,
     OP_DIR_GET,
+    OP_JOIN_LOBBY,
     OP_PING,
+    OP_POLL_EVENTS,
+    OP_REGISTER_PLAYER,
+    OP_ROUTE_REGISTER,
+    OP_START_GAME,
     decode_frame,
     encode_frame,
     opcode_to_action,
     BinaryGatewayServer,
+    ConnectionContext,
 )
 
 
@@ -165,9 +172,72 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["ok"])
         self.assertIn("token", payload)
 
+
+    async def test_two_player_launch_flow(self):
+        r, w = await asyncio.open_connection("127.0.0.1", self.gateway_port)
+
+        async def send(op, payload):
+            w.write(encode_frame(op, payload))
+            await w.drain()
+            hdr = await r.readexactly(4)
+            ln = struct.unpack(">I", hdr)[0]
+            body = await r.readexactly(ln)
+            return decode_frame(body)
+
+        _, auth = await send(OP_AUTH_LOGIN, {"username": "p1user", "password": "pw"})
+        self.assertTrue(auth["ok"])
+        _, reg1 = await send(OP_REGISTER_PLAYER, {"player_id": "p1", "nickname": "PlayerOne"})
+        self.assertTrue(reg1["ok"])
+        _, fac = await send(OP_DIR_GET, {"path": "/TitanServers"})
+        self.assertTrue(fac["ok"])
+
+        # register a factory via backend direct call so launch can spawn server
+        rr, ww = await asyncio.open_connection("127.0.0.1", self.backend_port)
+        ww.write((json.dumps({"action":"REGISTER_FACTORY","factory_id":"f1","host":"127.0.0.1","region":"na","max_processes":2})+"\n").encode())
+        await ww.drain()
+        await rr.readline()
+        ww.close()
+        await ww.wait_closed()
+
+        _, create = await send(OP_CREATE_LOBBY, {"name": "Ready", "map_name": "Garden", "region": "na", "max_players": 4})
+        self.assertTrue(create["ok"])
+        lobby_id = create["lobby"]["lobby_id"]
+
+        # second player does login/register/join on separate connection
+        r2, w2 = await asyncio.open_connection("127.0.0.1", self.gateway_port)
+
+        async def send2(op, payload):
+            w2.write(encode_frame(op, payload))
+            await w2.drain()
+            hdr = await r2.readexactly(4)
+            ln = struct.unpack(">I", hdr)[0]
+            body = await r2.readexactly(ln)
+            return decode_frame(body)
+
+        _, auth2 = await send2(OP_AUTH_LOGIN, {"username": "p2user", "password": "pw"})
+        self.assertTrue(auth2["ok"])
+        _, reg2 = await send2(OP_REGISTER_PLAYER, {"player_id": "p2", "nickname": "PlayerTwo"})
+        self.assertTrue(reg2["ok"])
+        _, join = await send2(OP_JOIN_LOBBY, {"lobby_id": lobby_id})
+        self.assertTrue(join["ok"])
+        _, route_reg = await send2(OP_ROUTE_REGISTER, {})
+        self.assertTrue(route_reg["ok"])
+
+        _, start = await send(OP_START_GAME, {"lobby_id": lobby_id})
+        self.assertTrue(start["ok"])
+        self.assertIn("launch", start)
+
+        _, poll2 = await send2(OP_POLL_EVENTS, {"after_seq": 0})
+        self.assertTrue(poll2["ok"])
+        self.assertTrue(any(e["type"] == "game_launch" for e in poll2["events"]))
+
+        w.close(); await w.wait_closed()
+        w2.close(); await w2.wait_closed()
+
     def test_opcode_mapping(self):
-        self.assertEqual(opcode_to_action(OP_PING, {})["action"], "PING")
-        self.assertEqual(opcode_to_action(OP_DIR_GET, {"path": "/Homeworld"})["action"], "TITAN_DIR_GET")
+        ctx = ConnectionContext()
+        self.assertEqual(opcode_to_action(OP_PING, {}, ctx)["action"], "PING")
+        self.assertEqual(opcode_to_action(OP_DIR_GET, {"path": "/Homeworld"}, ctx)["action"], "TITAN_DIR_GET")
 
 
 if __name__ == "__main__":
