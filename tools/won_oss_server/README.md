@@ -101,3 +101,7 @@ Summarize capture:
 ```bash
 PYTHONPATH=. python3 tools/won_oss_server/packet_sniffer_framework.py summary   --in tools/won_oss_server/captures/session.ndjson
 ```
+
+## Testing checklist
+
+See `tools/won_oss_server/testing.md` for the full automated + manual validation plan.
