@@ -16,6 +16,9 @@ This stack now includes:
 - `AUTH_LOGIN_REQ / AUTH_LOGIN_REPLY`
 - `DIR_GET_REQ / DIR_GET_REPLY`
 - `ROUTE_REGISTER_REQ / ROUTING_STATUS_REPLY`
+- `ROUTE_JOIN_REQ`
+- `ROUTE_CHAT_REQ / ROUTING_CHAT_EVENT`
+- `ROUTE_DATA_SET_REQ / ROUTING_DATA_OBJECT_REPLY`
 
 Envelope format:
 - `msg_type:u16`
@@ -75,4 +78,4 @@ python3 tools/won_oss_server/titan_binary_gateway.py --host 0.0.0.0 --port 9200 
 
 ## Notes
 
-This is still not packet-identical historical WON/Titan, but now includes explicit Titan-like message schemas, a protocol state machine, and golden-packet coverage for core auth/dir/routing-register paths.
+This is still not packet-identical historical WON/Titan, but now includes explicit Titan-like message schemas, a protocol state machine, and golden-packet coverage for core auth/dir/routing-register/join/chat/data-object paths.

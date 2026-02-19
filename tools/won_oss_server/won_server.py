@@ -487,6 +487,18 @@ class WONLikeState:
     def dir_list(self, path: str) -> Dict[str, Dict[str, Any]]:
         return self.directory.get(path, {})
 
+    def route_join(self, lobby_id: str, player_id: str) -> None:
+        self.join_lobby(lobby_id, player_id)
+
+    def route_set_data_object(self, lobby_id: str, key: str, value: str) -> None:
+        lobby = self.lobbies[lobby_id]
+        lobby.metadata.setdefault("data_objects", {})[key] = value
+        self._persist_lobbies()
+
+    def route_get_data_object(self, lobby_id: str, key: str) -> str:
+        lobby = self.lobbies[lobby_id]
+        return str(lobby.metadata.get("data_objects", {}).get(key, ""))
+
     def register_route_client(self, lobby_id: str, player_id: str) -> None:
         lobby = self.lobbies[lobby_id]
         if player_id not in lobby.players:
@@ -639,6 +651,14 @@ class WONLikeProtocolServer:
         if action == "TITAN_ROUTE_REGISTER":
             self.state.register_route_client(req["lobby_id"], req["player_id"])
             return {"ok": True, "registered": req.get("player_id"), "lobby_id": req.get("lobby_id")}
+        if action == "TITAN_ROUTE_JOIN":
+            self.state.route_join(req["lobby_id"], req["player_id"])
+            return {"ok": True}
+        if action == "TITAN_ROUTE_SET_DATA_OBJECT":
+            self.state.route_set_data_object(req["lobby_id"], req["key"], req["value"])
+            return {"ok": True}
+        if action == "TITAN_ROUTE_GET_DATA_OBJECT":
+            return {"ok": True, "key": req["key"], "value": self.state.route_get_data_object(req["lobby_id"], req["key"])}
         if action == "TITAN_START_GAME":
             launch = self.state.start_game_from_lobby(req["lobby_id"], req["requester_id"], req.get("port"))
             return {"ok": True, "launch": launch}

@@ -27,6 +27,8 @@ from tools.won_oss_server.titan_messages import (
     STATUS_OK,
     AuthLoginReply,
     DirGetReply,
+    RoutingChatEvent,
+    RoutingDataObjectReply,
     RoutingStatusReply,
     decode_request,
 )
@@ -228,6 +230,34 @@ class BinaryGatewayServer:
                 reply = RoutingStatusReply(STATUS_OK, "registered").encode()
             else:
                 reply = RoutingStatusReply(STATUS_FAIL, str(backend.get("error", "route_register_failed"))).encode()
+            return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
+        if kind == "route_join":
+            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_JOIN", "lobby_id": req["lobby_id"], "player_id": req["player_id"]})
+            if backend.get("ok"):
+                reply = RoutingStatusReply(STATUS_OK, "joined").encode()
+            else:
+                reply = RoutingStatusReply(STATUS_FAIL, str(backend.get("error", "route_join_failed"))).encode()
+            return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
+        if kind == "route_chat":
+            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_CHAT", "lobby_id": req["lobby_id"], "from_player": req["player_id"], "message": req["message"]})
+            if backend.get("ok"):
+                reply = RoutingChatEvent(STATUS_OK, req["lobby_id"], req["player_id"], req["message"]).encode()
+            else:
+                reply = RoutingStatusReply(STATUS_FAIL, str(backend.get("error", "route_chat_failed"))).encode()
+            return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
+        if kind == "route_data_set":
+            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_SET_DATA_OBJECT", "lobby_id": req["lobby_id"], "key": req["key"], "value": req["value"]})
+            if backend.get("ok"):
+                backend2 = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_GET_DATA_OBJECT", "lobby_id": req["lobby_id"], "key": req["key"]})
+                if backend2.get("ok"):
+                    reply = RoutingDataObjectReply(STATUS_OK, req["key"], str(backend2.get("value", ""))).encode()
+                else:
+                    reply = RoutingStatusReply(STATUS_FAIL, "data_object_read_failed").encode()
+            else:
+                reply = RoutingStatusReply(STATUS_FAIL, str(backend.get("error", "route_data_set_failed"))).encode()
             return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
 
         reply = RoutingStatusReply(STATUS_FAIL, "unknown_message").encode()

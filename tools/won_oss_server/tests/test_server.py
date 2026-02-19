@@ -48,8 +48,14 @@ from tools.won_oss_server.titan_messages import (
     MSG_AUTH_LOGIN_REQ,
     MSG_DIR_GET_REPLY,
     MSG_DIR_GET_REQ,
+    MSG_ROUTING_CHAT_EVENT,
+    MSG_ROUTING_DATA_OBJECT_REPLY,
     MSG_ROUTING_STATUS_REPLY,
+    RouteChatReq,
+    RouteDataSetReq,
+    RouteJoinReq,
     RouteRegisterReq,
+    RoutingDataObjectReply,
     RoutingStatusReply,
     decode_titan_message,
 )
@@ -317,6 +323,28 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mt, MSG_ROUTING_STATUS_REPLY)
         self.assertEqual(st, 0)
         self.assertEqual(RoutingStatusReply.decode(pl, st).detail, "registered")
+
+        # join via packet mode
+        join_hex = RouteJoinReq(lid, "p1").encode().hex()
+        _, resp = await self._binary_roundtrip(OP_TITAN_MESSAGE, {"packet_hex": join_hex})
+        mt, st, pl = decode_titan_message(bytes.fromhex(resp["packet_hex"]))
+        self.assertEqual(mt, MSG_ROUTING_STATUS_REPLY)
+        self.assertEqual(st, 0)
+
+        # chat event packet
+        chat_hex = RouteChatReq(lid, "p1", "hello").encode().hex()
+        _, resp = await self._binary_roundtrip(OP_TITAN_MESSAGE, {"packet_hex": chat_hex})
+        mt, st, pl = decode_titan_message(bytes.fromhex(resp["packet_hex"]))
+        self.assertEqual(mt, MSG_ROUTING_CHAT_EVENT)
+        self.assertEqual(st, 0)
+
+        # data object set/get packet
+        data_hex = RouteDataSetReq(lid, "motd", "welcome").encode().hex()
+        _, resp = await self._binary_roundtrip(OP_TITAN_MESSAGE, {"packet_hex": data_hex})
+        mt, st, pl = decode_titan_message(bytes.fromhex(resp["packet_hex"]))
+        self.assertEqual(mt, MSG_ROUTING_DATA_OBJECT_REPLY)
+        self.assertEqual(st, 0)
+        self.assertEqual(RoutingDataObjectReply.decode(pl, st).value, "welcome")
 
     async def test_state_machine_enforced(self):
         r, w = await asyncio.open_connection("127.0.0.1", self.gateway_port)

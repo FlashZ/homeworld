@@ -22,7 +22,12 @@ MSG_AUTH_LOGIN_REPLY = 0x1002
 MSG_DIR_GET_REQ = 0x2001
 MSG_DIR_GET_REPLY = 0x2002
 MSG_ROUTE_REGISTER_REQ = 0x3001
+MSG_ROUTE_JOIN_REQ = 0x3003
+MSG_ROUTE_CHAT_REQ = 0x3004
+MSG_ROUTE_DATA_SET_REQ = 0x3005
 MSG_ROUTING_STATUS_REPLY = 0x3002
+MSG_ROUTING_CHAT_EVENT = 0x3006
+MSG_ROUTING_DATA_OBJECT_REPLY = 0x3007
 
 STATUS_OK = 0
 STATUS_FAIL = 1
@@ -133,6 +138,78 @@ class RouteRegisterReq:
         return RouteRegisterReq(lobby_id, player_id)
 
 
+
+
+@dataclass
+class RouteJoinReq:
+    lobby_id: str
+    player_id: str
+
+    def encode(self) -> bytes:
+        return encode_titan_message(MSG_ROUTE_JOIN_REQ, STATUS_OK, _pack_fields((self.lobby_id, self.player_id)))
+
+    @staticmethod
+    def decode(payload: bytes) -> "RouteJoinReq":
+        lobby_id, player_id = _unpack_fields(payload, 2)
+        return RouteJoinReq(lobby_id, player_id)
+
+
+@dataclass
+class RouteChatReq:
+    lobby_id: str
+    player_id: str
+    message: str
+
+    def encode(self) -> bytes:
+        return encode_titan_message(MSG_ROUTE_CHAT_REQ, STATUS_OK, _pack_fields((self.lobby_id, self.player_id, self.message)))
+
+    @staticmethod
+    def decode(payload: bytes) -> "RouteChatReq":
+        lobby_id, player_id, message = _unpack_fields(payload, 3)
+        return RouteChatReq(lobby_id, player_id, message)
+
+
+@dataclass
+class RouteDataSetReq:
+    lobby_id: str
+    key: str
+    value: str
+
+    def encode(self) -> bytes:
+        return encode_titan_message(MSG_ROUTE_DATA_SET_REQ, STATUS_OK, _pack_fields((self.lobby_id, self.key, self.value)))
+
+    @staticmethod
+    def decode(payload: bytes) -> "RouteDataSetReq":
+        lobby_id, key, value = _unpack_fields(payload, 3)
+        return RouteDataSetReq(lobby_id, key, value)
+
+
+@dataclass
+class RoutingChatEvent:
+    status: int
+    lobby_id: str
+    player_id: str
+    message: str
+
+    def encode(self) -> bytes:
+        return encode_titan_message(MSG_ROUTING_CHAT_EVENT, self.status, _pack_fields((self.lobby_id, self.player_id, self.message)))
+
+
+@dataclass
+class RoutingDataObjectReply:
+    status: int
+    key: str
+    value: str
+
+    def encode(self) -> bytes:
+        return encode_titan_message(MSG_ROUTING_DATA_OBJECT_REPLY, self.status, _pack_fields((self.key, self.value)))
+
+    @staticmethod
+    def decode(payload: bytes, status: int) -> "RoutingDataObjectReply":
+        key, value = _unpack_fields(payload, 2)
+        return RoutingDataObjectReply(status, key, value)
+
+
 @dataclass
 class RoutingStatusReply:
     status: int
@@ -158,4 +235,13 @@ def decode_request(packet: bytes) -> Dict[str, object]:
     if msg_type == MSG_ROUTE_REGISTER_REQ:
         r = RouteRegisterReq.decode(payload)
         return {"kind": "route_register", "lobby_id": r.lobby_id, "player_id": r.player_id}
+    if msg_type == MSG_ROUTE_JOIN_REQ:
+        r = RouteJoinReq.decode(payload)
+        return {"kind": "route_join", "lobby_id": r.lobby_id, "player_id": r.player_id}
+    if msg_type == MSG_ROUTE_CHAT_REQ:
+        r = RouteChatReq.decode(payload)
+        return {"kind": "route_chat", "lobby_id": r.lobby_id, "player_id": r.player_id, "message": r.message}
+    if msg_type == MSG_ROUTE_DATA_SET_REQ:
+        r = RouteDataSetReq.decode(payload)
+        return {"kind": "route_data_set", "lobby_id": r.lobby_id, "key": r.key, "value": r.value}
     return {"kind": "unknown", "msg_type": msg_type}
