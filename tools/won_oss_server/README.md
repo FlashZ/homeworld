@@ -4,48 +4,56 @@ This stack now includes:
 
 - `won_server.py` (JSON core service)
 - `titan_bridge.py` (text/command Titan-style bridge)
-- `titan_binary_gateway.py` (binary gateway with state machine)
+- `titan_binary_gateway.py` (binary gateway with state machine + Titan message mode)
+- `titan_messages.py` (minimal Titan-like message schemas/codecs)
 
 ## Newly completed next step toward launchable flow
 
-### Binary protocol and state-machine upgrade
+### 1) Titan-like message schema module (MVP)
 
-The binary gateway now enforces connection state for a realistic flow:
+`tools/won_oss_server/titan_messages.py` now defines deterministic message codecs for:
+
+- `AUTH_LOGIN_REQ / AUTH_LOGIN_REPLY`
+- `DIR_GET_REQ / DIR_GET_REPLY`
+- `ROUTE_REGISTER_REQ / ROUTING_STATUS_REPLY`
+
+Envelope format:
+- `msg_type:u16`
+- `status:u16`
+- `payload_len:u32`
+- payload (length-prefixed UTF-8 fields)
+
+### 2) Typed binary gateway + protocol state machine
+
+The binary gateway enforces connection state:
 
 1. `AUTH_LOGIN` -> authenticated
 2. `REGISTER_PLAYER` -> player-ready
-3. `CREATE_LOBBY` / `JOIN_LOBBY`
-4. `ROUTE_REGISTER` per-lobby
-5. `ROUTE_CHAT`, `START_GAME`, `POLL_EVENTS`
+3. lobby create/join
+4. route register per lobby
+5. route chat / start game / poll events
 
-### Wire format (typed key/value, no JSON payload-in-frame)
+### 3) Titan message passthrough mode in gateway
+
+New gateway opcode:
+
+- `0x70` (`OP_TITAN_MESSAGE`) with field `packet_hex`
+
+The gateway decodes Titan-like packets from `packet_hex`, maps them to backend actions, then returns encoded Titan-like reply packets in `packet_hex`.
+
+### 4) Backend route semantics tightened
+
+- `TITAN_ROUTE_REGISTER` validates lobby membership.
+- `TITAN_ROUTE_CHAT` requires prior route registration.
+- `TITAN_START_GAME` preserves owner/min-player checks and emits `game_launch` events.
+
+## Binary frame format (gateway envelope)
 
 - 4-byte big-endian frame length
-- frame body:
+- body:
   - 1-byte opcode
   - 2-byte field count
   - repeated fields: `[key_len:u8][key][val_len:u16][value]`
-
-Values are UTF-8 strings on the wire and converted to primitive types where possible.
-
-### Supported binary opcodes
-
-- `0x01` (`OP_PING`) -> `PING`
-- `0x10` (`OP_DIR_GET`) -> `TITAN_DIR_GET`
-- `0x20` (`OP_ROUTE_CHAT`) -> `TITAN_ROUTE_CHAT` (requires route registration)
-- `0x30` (`OP_AUTH_LOGIN`) -> `AUTH_LOGIN`
-- `0x31` (`OP_REGISTER_PLAYER`) -> `REGISTER_PLAYER` (requires auth)
-- `0x32` (`OP_CREATE_LOBBY`) -> `CREATE_LOBBY` (requires player-ready)
-- `0x33` (`OP_JOIN_LOBBY`) -> `JOIN_LOBBY`
-- `0x34` (`OP_START_GAME`) -> `TITAN_START_GAME`
-- `0x35` (`OP_POLL_EVENTS`) -> `ROUTE_POLL`
-- `0x36` (`OP_ROUTE_REGISTER`) -> `TITAN_ROUTE_REGISTER`
-
-### Backend launch-path semantics tightened
-
-- `TITAN_ROUTE_REGISTER` now validates lobby membership before route registration.
-- `TITAN_ROUTE_CHAT` now requires prior route registration for sender.
-- `TITAN_START_GAME` still performs owner/min-player checks and emits `game_launch` events.
 
 ## Run core server
 
@@ -67,4 +75,4 @@ python3 tools/won_oss_server/titan_binary_gateway.py --host 0.0.0.0 --port 9200 
 
 ## Notes
 
-This is still not full packet-identical WON/Titan compatibility, but now uses a typed binary frame body and a stricter connection state machine that is closer to real protocol behavior.
+This is still not packet-identical historical WON/Titan, but now includes explicit Titan-like message schemas, a protocol state machine, and golden-packet coverage for core auth/dir/routing-register paths.

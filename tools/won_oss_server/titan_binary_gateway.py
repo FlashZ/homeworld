@@ -20,6 +20,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Tuple
 import json
+import binascii
+
+from tools.won_oss_server.titan_messages import (
+    STATUS_FAIL,
+    STATUS_OK,
+    AuthLoginReply,
+    DirGetReply,
+    RoutingStatusReply,
+    decode_request,
+)
 
 OP_PING = 0x01
 OP_DIR_GET = 0x10
@@ -31,6 +41,7 @@ OP_JOIN_LOBBY = 0x33
 OP_START_GAME = 0x34
 OP_POLL_EVENTS = 0x35
 OP_ROUTE_REGISTER = 0x36
+OP_TITAN_MESSAGE = 0x70
 
 
 class ConnState(str, Enum):
@@ -61,11 +72,12 @@ def _to_wire_map(payload: Dict[str, object]) -> Dict[str, str]:
 
 def _from_wire_map(payload: Dict[str, str]) -> Dict[str, object]:
     out: Dict[str, object] = {}
+    numeric_keys = {"after_seq", "max_players", "port"}
     for k, v in payload.items():
         vv = v.strip()
         if vv in ("true", "false"):
             out[k] = vv == "true"
-        elif vv.isdigit():
+        elif k in numeric_keys and vv.isdigit():
             out[k] = int(vv)
         elif (vv.startswith("{") and vv.endswith("}")) or (vv.startswith("[") and vv.endswith("]")):
             try:
@@ -162,6 +174,8 @@ def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionCon
         if ctx.state == ConnState.CONNECTED:
             return {"action": "INVALID", "error": "auth_required"}
         return {"action": "ROUTE_POLL", "player_id": str(payload.get("player_id", ctx.player_id or "")), "after_seq": int(payload.get("after_seq", 0))}
+    if opcode == OP_TITAN_MESSAGE:
+        return {"action": "TITAN_MESSAGE", "packet_hex": str(payload.get("packet_hex", ""))}
     return {"action": "UNKNOWN_BINARY_OPCODE", "opcode": opcode}
 
 
@@ -184,6 +198,41 @@ class BinaryGatewayServer:
         self.backend_host = backend_host
         self.backend_port = backend_port
 
+    async def _handle_titan_packet(self, packet_hex: str) -> Dict[str, object]:
+        try:
+            packet = binascii.unhexlify(packet_hex.encode("ascii"))
+        except Exception:
+            return {"ok": False, "error": "invalid_packet_hex"}
+
+        req = decode_request(packet)
+        kind = req.get("kind")
+        if kind == "auth_login":
+            backend = await call_backend(self.backend_host, self.backend_port, {"action": "AUTH_LOGIN", "username": req["username"], "password": req["password"]})
+            if backend.get("ok"):
+                reply = AuthLoginReply(STATUS_OK, str(backend.get("token", ""))).encode()
+            else:
+                reply = AuthLoginReply(STATUS_FAIL, str(backend.get("error", "auth_failed"))).encode()
+            return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
+        if kind == "dir_get":
+            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_DIR_GET", "path": req["path"]})
+            if backend.get("ok"):
+                reply = DirGetReply(STATUS_OK, json.dumps(backend.get("entities", {}))).encode()
+            else:
+                reply = DirGetReply(STATUS_FAIL, json.dumps({"error": backend.get("error", "dir_failed")})).encode()
+            return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
+        if kind == "route_register":
+            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_REGISTER", "lobby_id": req["lobby_id"], "player_id": req["player_id"]})
+            if backend.get("ok"):
+                reply = RoutingStatusReply(STATUS_OK, "registered").encode()
+            else:
+                reply = RoutingStatusReply(STATUS_FAIL, str(backend.get("error", "route_register_failed"))).encode()
+            return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
+        reply = RoutingStatusReply(STATUS_FAIL, "unknown_message").encode()
+        return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
+
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         ctx = ConnectionContext()
         try:
@@ -202,7 +251,10 @@ class BinaryGatewayServer:
                     response = {"ok": False, "error": "unknown_binary_opcode", "opcode": opcode}
                 else:
                     try:
-                        response = await call_backend(self.backend_host, self.backend_port, action)
+                        if action.get("action") == "TITAN_MESSAGE":
+                            response = await self._handle_titan_packet(str(action.get("packet_hex", "")))
+                        else:
+                            response = await call_backend(self.backend_host, self.backend_port, action)
                     except Exception as exc:
                         response = {"ok": False, "error": str(exc)}
 

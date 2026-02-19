@@ -30,6 +30,7 @@ from tools.won_oss_server.titan_binary_gateway import (
     OP_ROUTE_CHAT,
     OP_ROUTE_REGISTER,
     OP_START_GAME,
+    OP_TITAN_MESSAGE,
     decode_frame,
     encode_frame,
     opcode_to_action,
@@ -38,6 +39,20 @@ from tools.won_oss_server.titan_binary_gateway import (
     ConnState,
 )
 
+from tools.won_oss_server.titan_messages import (
+    AuthLoginReply,
+    AuthLoginReq,
+    DirGetReply,
+    DirGetReq,
+    MSG_AUTH_LOGIN_REPLY,
+    MSG_AUTH_LOGIN_REQ,
+    MSG_DIR_GET_REPLY,
+    MSG_DIR_GET_REQ,
+    MSG_ROUTING_STATUS_REPLY,
+    RouteRegisterReq,
+    RoutingStatusReply,
+    decode_titan_message,
+)
 
 class WONServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -128,6 +143,26 @@ class BridgeParserTests(unittest.TestCase):
         self.assertEqual(parse_legacy_command("REGISTER_FACTORY f1 127.0.0.1 na 2")["action"], "REGISTER_FACTORY")
 
 
+
+
+class TitanMessageCodecTests(unittest.TestCase):
+    def test_auth_login_req_roundtrip_golden(self):
+        pkt = AuthLoginReq("alice", "pw").encode()
+        msg_type, status, payload = decode_titan_message(pkt)
+        self.assertEqual(msg_type, MSG_AUTH_LOGIN_REQ)
+        self.assertEqual(status, 0)
+        r = AuthLoginReq.decode(payload)
+        self.assertEqual(r.username, "alice")
+        self.assertEqual(r.password, "pw")
+
+    def test_dir_reply_roundtrip_golden(self):
+        pkt = DirGetReply(0, '{"AuthServer":{"host":"127.0.0.1"}}').encode()
+        msg_type, status, payload = decode_titan_message(pkt)
+        self.assertEqual(msg_type, MSG_DIR_GET_REPLY)
+        self.assertEqual(status, 0)
+        r = DirGetReply.decode(payload, status)
+        self.assertIn("AuthServer", r.entities_json)
+
 class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -146,6 +181,15 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
         await self.backend.wait_closed()
         self.store.close()
         self.tmp.cleanup()
+
+    async def _request_json(self, payload):
+        r, w = await asyncio.open_connection("127.0.0.1", self.backend_port)
+        w.write((json.dumps(payload) + "\n").encode())
+        await w.drain()
+        line = await r.readline()
+        w.close()
+        await w.wait_closed()
+        return json.loads(line.decode())
 
     async def _binary_roundtrip(self, opcode: int, payload: dict):
         r, w = await asyncio.open_connection("127.0.0.1", self.gateway_port)
@@ -237,6 +281,42 @@ class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
         w.close(); await w.wait_closed()
         w2.close(); await w2.wait_closed()
 
+
+
+    async def test_titan_packet_mode_auth_dir_route(self):
+        # auth packet
+        auth_hex = AuthLoginReq("pktuser", "pw").encode().hex()
+        op, resp = await self._binary_roundtrip(OP_TITAN_MESSAGE, {"packet_hex": auth_hex})
+        self.assertEqual(op, OP_TITAN_MESSAGE)
+        self.assertTrue(resp["ok"])
+        reply_pkt = bytes.fromhex(resp["packet_hex"])
+        mt, st, pl = decode_titan_message(reply_pkt)
+        self.assertEqual(mt, MSG_AUTH_LOGIN_REPLY)
+        self.assertEqual(st, 0)
+        login_rep = AuthLoginReply.decode(pl, st)
+        self.assertTrue(login_rep.token.startswith("tok_"))
+
+        # dir packet
+        dir_hex = DirGetReq("/TitanServers").encode().hex()
+        op, resp = await self._binary_roundtrip(OP_TITAN_MESSAGE, {"packet_hex": dir_hex})
+        self.assertTrue(resp["ok"])
+        mt, st, pl = decode_titan_message(bytes.fromhex(resp["packet_hex"]))
+        self.assertEqual(mt, MSG_DIR_GET_REPLY)
+        self.assertEqual(st, 0)
+        self.assertIn("AuthServer", DirGetReply.decode(pl, st).entities_json)
+
+        # route-register packet (create lobby first)
+        tok = (await self._binary_roundtrip(OP_AUTH_LOGIN, {"username":"u1","password":"pw"}))[1]["token"]
+        await self._request_json({"action":"REGISTER_PLAYER","player_id":"p1","nickname":"P1"})
+        lob = await self._request_json({"action":"CREATE_LOBBY","token":tok,"owner_id":"p1","name":"L","map_name":"Garden","region":"na","max_players":4})
+        lid = lob["lobby"]["lobby_id"]
+        rr_hex = RouteRegisterReq(lid, "p1").encode().hex()
+        op, resp = await self._binary_roundtrip(OP_TITAN_MESSAGE, {"packet_hex": rr_hex})
+        self.assertTrue(resp["ok"])
+        mt, st, pl = decode_titan_message(bytes.fromhex(resp["packet_hex"]))
+        self.assertEqual(mt, MSG_ROUTING_STATUS_REPLY)
+        self.assertEqual(st, 0)
+        self.assertEqual(RoutingStatusReply.decode(pl, st).detail, "registered")
 
     async def test_state_machine_enforced(self):
         r, w = await asyncio.open_connection("127.0.0.1", self.gateway_port)
