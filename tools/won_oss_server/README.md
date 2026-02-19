@@ -1,44 +1,37 @@
 # WON OSS Server (Homeworld-oriented)
 
-This stack now includes a JSON backend plus a stricter Titan-oriented bridge layer.
+This stack now includes:
 
-- `won_server.py` (core service)
-- `titan_bridge.py` (legacy + `TITAN ...` command translator)
+- `won_server.py` (JSON core service)
+- `titan_bridge.py` (text/command Titan-style bridge)
+- `titan_binary_gateway.py` (minimal binary frame gateway)
 
-## Newly completed high-value items
+## Newly completed next step
 
-1. **Typed Homeworld data objects**
-   - Implements and publishes key Titan/Homeworld-style object names:
-     - `HomeworldValidVersions`
-     - `Description`
-     - `RoomFlags`
-     - `__RSClientCount`
-     - `__FactCur_RoutingServHWGame`
-     - `__FactTotal_RoutingServHWGame`
-     - `__ServerUptime`
+### Binary gateway MVP
 
-2. **Stricter bridge mapping**
-   - Supports explicit forms:
-     - `TITAN DIR GET <path>`
-     - `TITAN ROUTE CHAT <lobby_id> <from_player> <message...>`
-   - Also keeps shorthand commands for easier ops.
+A new binary transport path is now available for incremental client compatibility work.
 
-3. **Persistent sessions and routing events**
-   - Sessions persisted in SQLite (`sessions` table)
-   - Routing/chat events persisted in SQLite (`events` table)
+**Wire format (MVP):**
+- 4-byte big-endian frame length
+- frame body:
+  - 1-byte opcode
+  - UTF-8 JSON payload bytes
 
-4. **Managed factory process supervision**
-   - `FACTORY_START_PROCESS` now starts a managed subprocess placeholder and tracks live managed process count.
-   - Factory object counters in `/TitanServers` are updated with running/total process info.
+**Supported binary opcodes:**
+- `0x01` (`OP_PING`) -> `PING`
+- `0x10` (`OP_DIR_GET`) -> `TITAN_DIR_GET`
+- `0x20` (`OP_ROUTE_CHAT`) -> `TITAN_ROUTE_CHAT`
+- `0x30` (`OP_AUTH_LOGIN`) -> `AUTH_LOGIN`
 
-## Existing implemented features
+This is intentionally not full historical Titan packet parity yet, but it creates a real binary listener so compatibility can evolve away from command-only bridging.
 
-- Simple auth with account-on-first-login (`AUTH_LOGIN`, `AUTH_VALIDATE`), no CD-keys.
-- Lobby lifecycle with optional password.
-- Matchmaking and server listing.
-- Directory service with `/Homeworld` and `/TitanServers`.
-- Health/metrics observability.
-- SQLite persistence.
+## Previously implemented high-value items
+
+1. Typed Homeworld data objects (`HomeworldValidVersions`, `Description`, `RoomFlags`, `__RSClientCount`, `__FactCur_RoutingServHWGame`, `__FactTotal_RoutingServHWGame`, `__ServerUptime`)
+2. Stricter Titan bridge mapping (`TITAN DIR GET`, `TITAN ROUTE CHAT`)
+3. Persistent sessions and routing events
+4. Managed factory process supervision
 
 ## Run core server
 
@@ -46,19 +39,16 @@ This stack now includes a JSON backend plus a stricter Titan-oriented bridge lay
 python3 tools/won_oss_server/won_server.py --host 0.0.0.0 --port 9000 --db-path tools/won_oss_server/won_server.db
 ```
 
-## Run bridge daemon
+## Run text bridge
 
 ```bash
 python3 tools/won_oss_server/titan_bridge.py --host 0.0.0.0 --port 9100 --backend-host 127.0.0.1 --backend-port 9000
 ```
 
-## Example bridge commands
+## Run binary gateway
 
-```text
-LOGIN player1 mypass
-REGISTER_PLAYER p1 Kushan
-TITAN DIR GET /TitanServers
-TITAN ROUTE CHAT lob_abc p1 hello world
+```bash
+python3 tools/won_oss_server/titan_binary_gateway.py --host 0.0.0.0 --port 9200 --backend-host 127.0.0.1 --backend-port 9000
 ```
 
 ## Notes

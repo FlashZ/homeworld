@@ -1,6 +1,7 @@
 import contextlib
 import asyncio
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,15 @@ from tools.won_oss_server.won_server import (
     run_server,
 )
 from tools.won_oss_server.titan_bridge import parse_legacy_command
+from tools.won_oss_server.titan_binary_gateway import (
+    OP_AUTH_LOGIN,
+    OP_DIR_GET,
+    OP_PING,
+    decode_frame,
+    encode_frame,
+    opcode_to_action,
+    BinaryGatewayServer,
+)
 
 
 class WONServerTests(unittest.IsolatedAsyncioTestCase):
@@ -107,6 +117,57 @@ class BridgeParserTests(unittest.TestCase):
         self.assertEqual(parse_legacy_command("TITAN DIR GET /TitanServers")["action"], "TITAN_DIR_GET")
         self.assertEqual(parse_legacy_command("TITAN ROUTE CHAT lob_1 p1 hi there")["action"], "TITAN_ROUTE_CHAT")
         self.assertEqual(parse_legacy_command("REGISTER_FACTORY f1 127.0.0.1 na 2")["action"], "REGISTER_FACTORY")
+
+
+class BinaryGatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "won_test.db")
+        self.backend, _, self.store = await run_server("127.0.0.1", 0, timeout_s=60, db_path=self.db_path)
+        self.backend_port = self.backend.sockets[0].getsockname()[1]
+
+        gateway = BinaryGatewayServer("127.0.0.1", self.backend_port)
+        self.gateway_srv = await asyncio.start_server(gateway.handle_client, "127.0.0.1", 0)
+        self.gateway_port = self.gateway_srv.sockets[0].getsockname()[1]
+
+    async def asyncTearDown(self):
+        self.gateway_srv.close()
+        await self.gateway_srv.wait_closed()
+        self.backend.close()
+        await self.backend.wait_closed()
+        self.store.close()
+        self.tmp.cleanup()
+
+    async def _binary_roundtrip(self, opcode: int, payload: dict):
+        r, w = await asyncio.open_connection("127.0.0.1", self.gateway_port)
+        w.write(encode_frame(opcode, payload))
+        await w.drain()
+        hdr = await r.readexactly(4)
+        ln = struct.unpack(">I", hdr)[0]
+        body = await r.readexactly(ln)
+        w.close()
+        await w.wait_closed()
+        return decode_frame(body)
+
+    async def test_ping_and_dir_get(self):
+        op, payload = await self._binary_roundtrip(OP_PING, {})
+        self.assertEqual(op, OP_PING)
+        self.assertTrue(payload["ok"])
+
+        op, payload = await self._binary_roundtrip(OP_DIR_GET, {"path": "/TitanServers"})
+        self.assertEqual(op, OP_DIR_GET)
+        self.assertTrue(payload["ok"])
+        self.assertIn("AuthServer", payload["entities"])
+
+    async def test_auth_login_opcode(self):
+        op, payload = await self._binary_roundtrip(OP_AUTH_LOGIN, {"username": "buser", "password": "pw"})
+        self.assertEqual(op, OP_AUTH_LOGIN)
+        self.assertTrue(payload["ok"])
+        self.assertIn("token", payload)
+
+    def test_opcode_mapping(self):
+        self.assertEqual(opcode_to_action(OP_PING, {})["action"], "PING")
+        self.assertEqual(opcode_to_action(OP_DIR_GET, {"path": "/Homeworld"})["action"], "TITAN_DIR_GET")
 
 
 if __name__ == "__main__":
